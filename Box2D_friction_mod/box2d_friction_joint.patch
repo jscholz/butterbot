@@ -1,0 +1,802 @@
+diff -rupN Box2D_v2.2.1/Box2D/Dynamics/Joints/b2FrictionJoint.cpp Box2D_v2.2.1_fjmod/Box2D/Dynamics/Joints/b2FrictionJoint.cpp
+--- Box2D_v2.2.1/Box2D/Dynamics/Joints/b2FrictionJoint.cpp	2011-09-04 15:18:34.000000000 -0400
++++ Box2D_v2.2.1_fjmod/Box2D/Dynamics/Joints/b2FrictionJoint.cpp	2012-11-13 21:13:29.000000000 -0500
+@@ -51,6 +51,13 @@ b2FrictionJoint::b2FrictionJoint(const b
+ 
+ 	m_maxForce = def->maxForce;
+ 	m_maxTorque = def->maxTorque;
++
++	m_muX = def->muX;
++	m_muY = def->muY;
++	m_muT = def->muT;
++	m_muXY.Set(
++			b2Vec2(m_muX, 0),
++			b2Vec2(0, m_muY));
+ }
+ 
+ void b2FrictionJoint::InitVelocityConstraints(const b2SolverData& data)
+@@ -72,11 +79,13 @@ void b2FrictionJoint::InitVelocityConstr
+ 	b2Vec2 vB = data.velocities[m_indexB].v;
+ 	float32 wB = data.velocities[m_indexB].w;
+ 
+-	b2Rot qA(aA), qB(aB);
++	// set rotation matrices corresponding to body angles
++	m_qA.Set(aA);
++	m_qB.Set(aB);
+ 
+ 	// Compute the effective mass matrix.
+-	m_rA = b2Mul(qA, m_localAnchorA - m_localCenterA);
+-	m_rB = b2Mul(qB, m_localAnchorB - m_localCenterB);
++	m_rA = b2Mul(m_qA, m_localAnchorA - m_localCenterA);
++	m_rB = b2Mul(m_qB, m_localAnchorB - m_localCenterB);
+ 
+ 	// J = [-I -r1_skew I r2_skew]
+ 	//     [ 0       -1 0       1]
+@@ -104,7 +113,8 @@ void b2FrictionJoint::InitVelocityConstr
+ 		m_angularMass = 1.0f / m_angularMass;
+ 	}
+ 
+-	if (data.step.warmStarting)
++	// warm starting causes instabilities for 2D friction
++	if (false) // (data.step.warmStarting)
+ 	{
+ 		// Scale impulses to support a variable time step.
+ 		m_linearImpulse *= data.step.dtRatio;
+@@ -143,7 +153,7 @@ void b2FrictionJoint::SolveVelocityConst
+ 	// Solve angular friction
+ 	{
+ 		float32 Cdot = wB - wA;
+-		float32 impulse = -m_angularMass * Cdot;
++		float32 impulse = -m_angularMass * m_muT * Cdot; // scaled angular impulse
+ 
+ 		float32 oldImpulse = m_angularImpulse;
+ 		float32 maxImpulse = h * m_maxTorque;
+@@ -158,7 +168,12 @@ void b2FrictionJoint::SolveVelocityConst
+ 	{
+ 		b2Vec2 Cdot = vB + b2Cross(wB, m_rB) - vA - b2Cross(wA, m_rA);
+ 
+-		b2Vec2 impulse = -b2Mul(m_linearMass, Cdot);
++		// Compute orthogonal friction impulses in bodyB frame, and rotate back
++		b2Vec2 vb = b2MulT(m_qB, Cdot);		// velocity in constraint frame
++		b2Vec2 fb = b2Mul(m_muXY, vb);  	// friction forces in constraint frame
++		b2Vec2 fw = b2Mul(m_qB, fb);		// friction forces in world frame
++		b2Vec2 impulse = -b2Mul(m_linearMass, fw);
++
+ 		b2Vec2 oldImpulse = m_linearImpulse;
+ 		m_linearImpulse += impulse;
+ 
+@@ -234,6 +249,38 @@ float32 b2FrictionJoint::GetMaxTorque() 
+ 	return m_maxTorque;
+ }
+ 
++float32 b2FrictionJoint::GetMuX() const
++{
++	return m_muX;
++}
++
++void b2FrictionJoint::SetMuX(float32 muX)
++{
++	m_muX = muX;
++	m_muXY.ex.x = m_muX;
++}
++
++float32 b2FrictionJoint::GetMuY() const
++{
++	return m_muY;
++}
++
++void b2FrictionJoint::SetMuY(float32 muY)
++{
++	m_muY = muY;
++	m_muXY.ey.y = m_muY;
++}
++
++float32 b2FrictionJoint::GetMuT() const
++{
++	return m_muT;
++}
++
++void b2FrictionJoint::SetMuT(float32 muT)
++{
++	m_muT = muT;
++}
++
+ void b2FrictionJoint::Dump()
+ {
+ 	int32 indexA = m_bodyA->m_islandIndex;
+diff -rupN Box2D_v2.2.1/Box2D/Dynamics/Joints/b2FrictionJoint.h Box2D_v2.2.1_fjmod/Box2D/Dynamics/Joints/b2FrictionJoint.h
+--- Box2D_v2.2.1/Box2D/Dynamics/Joints/b2FrictionJoint.h	2011-09-04 15:11:18.000000000 -0400
++++ Box2D_v2.2.1_fjmod/Box2D/Dynamics/Joints/b2FrictionJoint.h	2012-11-13 21:13:29.000000000 -0500
+@@ -21,6 +21,36 @@
+ 
+ #include <Box2D/Dynamics/Joints/b2Joint.h>
+ 
++
++/**
++ * Explanation of 2D friction mod:
++ * The purpose of this joint is to simulate friction in the absence of
++ * contact events.  The standard use-case is top-down worlds, where we
++ * want to model objects such as blocks or wheels interacting with the
++ * (hypothetical) surface.  Gravity is set to zero in these scenarios
++ * and there is no normal force, which leaves joints as the mechanism
++ * for processing these forces inside the solver.  The underlying
++ * friction model is viscous, since impules are proportional to velocity
++ * (as with linear/angular damping).  To simulate coloumb friction, we'd
++ * have to normalize the velocity vector "Cdot" in SolveVelocityConstraints
++ * (not implemented).
++ *
++ * In order to make sense, this must assume that the linear friction
++ * components are attached to one of the bodies.  When simulating
++ * top-down car wheels, bodyA is the ground body and bodyB is a wheel.
++ * The order of these is important, since the coordinate frame for
++ * linear friction is attached to bodyB.
++ *
++ * Changes from Erin's version:
++ * > added member variables for body orientations, since needed in solver
++ * > added three friction coefficients for X, Y, and Theta, (w/ getter/setters)
++ * > scaled angular impules update by muT
++ * > rotated and scaled linear impulse by muX,muY
++ *
++ * jkscholz@gatech.edu
++ * 11/6/2012
++ */
++
+ /// Friction joint definition.
+ struct b2FrictionJointDef : public b2JointDef
+ {
+@@ -31,6 +61,9 @@ struct b2FrictionJointDef : public b2Joi
+ 		localAnchorB.SetZero();
+ 		maxForce = 0.0f;
+ 		maxTorque = 0.0f;
++		muX = 0;
++		muY = 0;
++		muT = 0;
+ 	}
+ 
+ 	/// Initialize the bodies, anchors, axis, and reference angle using the world
+@@ -48,6 +81,11 @@ struct b2FrictionJointDef : public b2Joi
+ 
+ 	/// The maximum friction torque in N-m.
+ 	float32 maxTorque;
++	
++	/// The orthogonal and angular friction components
++	float32 muX;
++	float32 muY;
++	float32 muT;
+ };
+ 
+ /// Friction joint. This is used for top-down friction.
+@@ -79,6 +117,24 @@ public:
+ 	/// Get the maximum friction torque in N*m.
+ 	float32 GetMaxTorque() const;
+ 
++	/// Get the X friction component
++	float32 GetMuX() const;
++
++	/// Set the X friction component
++	void SetMuX(float32 muX);
++
++	/// Get the Y friction component
++	float32 GetMuY() const;
++
++	/// Set the Y friction component
++	void SetMuY(float32 muY);
++
++	/// Get the T friction component
++	float32 GetMuT() const;
++
++	/// Set the T friction component
++	void SetMuT(float32 muT);
++
+ 	/// Dump joint to dmLog
+ 	void Dump();
+ 
+@@ -114,6 +170,13 @@ protected:
+ 	float32 m_invIB;
+ 	b2Mat22 m_linearMass;
+ 	float32 m_angularMass;
++	b2Rot m_qA, m_qB;
++
++	/// Orthogonal friction components
++	float32 m_muX;
++	float32 m_muY;
++	float32 m_muT;
++	b2Mat22 m_muXY; // matrix representation of the linear friction components
+ };
+ 
+ #endif
+diff -rupN Box2D_v2.2.1/Testbed/Tests/TestEntries.cpp Box2D_v2.2.1_fjmod/Testbed/Tests/TestEntries.cpp
+--- Box2D_v2.2.1/Testbed/Tests/TestEntries.cpp	2011-09-11 23:55:26.000000000 -0400
++++ Box2D_v2.2.1_fjmod/Testbed/Tests/TestEntries.cpp	2012-11-13 21:13:29.000000000 -0500
+@@ -1,28 +1,28 @@
+ /*
+-* Copyright (c) 2006-2009 Erin Catto http://www.box2d.org
+-*
+-* This software is provided 'as-is', without any express or implied
+-* warranty.  In no event will the authors be held liable for any damages
+-* arising from the use of this software.
+-* Permission is granted to anyone to use this software for any purpose,
+-* including commercial applications, and to alter it and redistribute it
+-* freely, subject to the following restrictions:
+-* 1. The origin of this software must not be misrepresented; you must not
+-* claim that you wrote the original software. If you use this software
+-* in a product, an acknowledgment in the product documentation would be
+-* appreciated but is not required.
+-* 2. Altered source versions must be plainly marked as such, and must not be
+-* misrepresented as being the original software.
+-* 3. This notice may not be removed or altered from any source distribution.
+-*/
++ * Copyright (c) 2006-2009 Erin Catto http://www.box2d.org
++ *
++ * This software is provided 'as-is', without any express or implied
++ * warranty.  In no event will the authors be held liable for any damages
++ * arising from the use of this software.
++ * Permission is granted to anyone to use this software for any purpose,
++ * including commercial applications, and to alter it and redistribute it
++ * freely, subject to the following restrictions:
++ * 1. The origin of this software must not be misrepresented; you must not
++ * claim that you wrote the original software. If you use this software
++ * in a product, an acknowledgment in the product documentation would be
++ * appreciated but is not required.
++ * 2. Altered source versions must be plainly marked as such, and must not be
++ * misrepresented as being the original software.
++ * 3. This notice may not be removed or altered from any source distribution.
++ */
+ 
+ #include "../Framework/Test.h"
+ #include "../Framework/Render.h"
+ 
+ #ifdef __APPLE__
+-	#include <GLUT/glut.h>
++#include <GLUT/glut.h>
+ #else
+-	#include "freeglut/freeglut.h"
++#include "freeglut/freeglut.h"
+ #endif
+ 
+ #include <cstring>
+@@ -73,53 +73,57 @@ using namespace std;
+ #include "VaryingRestitution.h"
+ #include "VerticalStack.h"
+ #include "Web.h"
++#include "TopDownCar.h"
++#include "WheelConstraint.h"
+ 
+ TestEntry g_testEntries[] =
+ {
+-	{"Tumbler", Tumbler::Create},
+-	{"Tiles", Tiles::Create},
+-	{"Dump Shell", DumpShell::Create},
+-	{"Gears", Gears::Create},
+-	{"Cantilever", Cantilever::Create},
+-	{"Varying Restitution", VaryingRestitution::Create},
+-	{"Character Collision", CharacterCollision::Create},
+-	{"Edge Test", EdgeTest::Create},
+-	{"Body Types", BodyTypes::Create},
+-	{"Shape Editing", ShapeEditing::Create},
+-	{"Car", Car::Create},
+-	{"Apply Force", ApplyForce::Create},
+-	{"Prismatic", Prismatic::Create},
+-	{"Vertical Stack", VerticalStack::Create},
+-	{"SphereStack", SphereStack::Create},
+-	{"Revolute", Revolute::Create},
+-	{"Pulleys", Pulleys::Create},
+-	{"Polygon Shapes", PolyShapes::Create},
+-	//{"Rope", Rope::Create},
+-	{"Web", Web::Create},
+-	{"RopeJoint", RopeJoint::Create},
+-	{"One-Sided Platform", OneSidedPlatform::Create},
+-	{"Pinball", Pinball::Create},
+-	{"Bullet Test", BulletTest::Create},
+-	{"Continuous Test", ContinuousTest::Create},
+-	{"Time of Impact", TimeOfImpact::Create},
+-	{"Ray-Cast", RayCast::Create},
+-	{"Confined", Confined::Create},
+-	{"Pyramid", Pyramid::Create},
+-	{"Theo Jansen's Walker", TheoJansen::Create},
+-	{"Edge Shapes", EdgeShapes::Create},
+-	{"PolyCollision", PolyCollision::Create},
+-	{"Bridge", Bridge::Create},
+-	{"Breakable", Breakable::Create},
+-	{"Chain", Chain::Create},
+-	{"Collision Filtering", CollisionFiltering::Create},
+-	{"Collision Processing", CollisionProcessing::Create},
+-	{"Compound Shapes", CompoundShapes::Create},
+-	{"Distance Test", DistanceTest::Create},
+-	{"Dominos", Dominos::Create},
+-	{"Dynamic Tree", DynamicTreeTest::Create},
+-	{"Sensor Test", SensorTest::Create},
+-	{"Slider Crank", SliderCrank::Create},
+-	{"Varying Friction", VaryingFriction::Create},
+-	{"Add Pair Stress Test", AddPair::Create},
+-	{NULL, NULL}
++		{"TopDownCar", TopDownCar::Create},
++		{"WheelConstraint", TopDownWheel::Create},
++		{"Tumbler", Tumbler::Create},
++		{"Tiles", Tiles::Create},
++		{"Dump Shell", DumpShell::Create},
++		{"Gears", Gears::Create},
++		{"Cantilever", Cantilever::Create},
++		{"Varying Restitution", VaryingRestitution::Create},
++		{"Character Collision", CharacterCollision::Create},
++		{"Edge Test", EdgeTest::Create},
++		{"Body Types", BodyTypes::Create},
++		{"Shape Editing", ShapeEditing::Create},
++		{"Car", Car::Create},
++		{"Apply Force", ApplyForce::Create},
++		{"Prismatic", Prismatic::Create},
++		{"Vertical Stack", VerticalStack::Create},
++		{"SphereStack", SphereStack::Create},
++		{"Revolute", Revolute::Create},
++		{"Pulleys", Pulleys::Create},
++//		{"Polygon Shapes", PolyShapes::Create},
++		//{"Rope", Rope::Create},
++		{"Web", Web::Create},
++		{"RopeJoint", RopeJoint::Create},
++		{"One-Sided Platform", OneSidedPlatform::Create},
++		{"Pinball", Pinball::Create},
++		{"Bullet Test", BulletTest::Create},
++		{"Continuous Test", ContinuousTest::Create},
++		{"Time of Impact", TimeOfImpact::Create},
++//		{"Ray-Cast", RayCast::Create},
++		{"Confined", Confined::Create},
++		{"Pyramid", Pyramid::Create},
++		{"Theo Jansen's Walker", TheoJansen::Create},
++//		{"Edge Shapes", EdgeShapes::Create},
++		{"PolyCollision", PolyCollision::Create},
++		{"Bridge", Bridge::Create},
++		{"Breakable", Breakable::Create},
++		{"Chain", Chain::Create},
++		{"Collision Filtering", CollisionFiltering::Create},
++		{"Collision Processing", CollisionProcessing::Create},
++		{"Compound Shapes", CompoundShapes::Create},
++		{"Distance Test", DistanceTest::Create},
++		{"Dominos", Dominos::Create},
++		{"Dynamic Tree", DynamicTreeTest::Create},
++		{"Sensor Test", SensorTest::Create},
++		{"Slider Crank", SliderCrank::Create},
++		{"Varying Friction", VaryingFriction::Create},
++		{"Add Pair Stress Test", AddPair::Create},
++		{NULL, NULL}
+ };
+diff -rupN Box2D_v2.2.1/Testbed/Tests/TopDownCar.h Box2D_v2.2.1_fjmod/Testbed/Tests/TopDownCar.h
+--- Box2D_v2.2.1/Testbed/Tests/TopDownCar.h	1969-12-31 19:00:00.000000000 -0500
++++ Box2D_v2.2.1_fjmod/Testbed/Tests/TopDownCar.h	2012-11-13 21:13:29.000000000 -0500
+@@ -0,0 +1,255 @@
++/*
++ * Copyright (c) 2006-2009 Erin Catto http://www.gphysics.com
++ *
++ * This software is provided 'as-is', without any express or implied
++ * warranty.  In no event will the authors be held liable for any damages
++ * arising from the use of this software.
++ * Permission is granted to anyone to use this software for any purpose,
++ * including commercial applications, and to alter it and redistribute it
++ * freely, subject to the following restrictions:
++ * 1. The origin of this software must not be misrepresented; you must not
++ * claim that you wrote the original software. If you use this software
++ * in a product, an acknowledgment in the product documentation would be
++ * appreciated but is not required.
++ * 2. Altered source versions must be plainly marked as such, and must not be
++ * misrepresented as being the original software.
++ * 3. This notice may not be removed or altered from any source distribution.
++ */
++
++#ifndef TOP_DOWN_CAR_H
++#define TOP_DOWN_CAR_H
++
++#include <stdio.h>
++
++class MyCar
++{
++ public:
++  float32 wheelDims[2];
++
++  float32 halfWidth;
++  float32 halfHeight;
++  float32 defaultDensity;
++  float32 defaultFriction;
++  float32 accelerateForce;
++
++  b2Body* wheels[4];
++  b2Body* chassis;
++  b2World* world;
++  b2Body* ground;
++  b2RevoluteJoint *frontLeftJoint;
++
++  bool frontWheelDrive;
++
++ MyCar(b2World *_world, b2Body* _ground, float32 width, float32 height) :
++  halfWidth(width/2.0f),
++    halfHeight(height/2.0f),
++    defaultDensity(20.0f),
++    defaultFriction(0.68f),
++    accelerateForce(2500.0f),
++    ground(_ground),
++    world(_world),
++    frontWheelDrive(true)
++      {
++	wheelDims[0] = .125;
++	wheelDims[1] = .5;
++
++	{
++	  b2BodyDef chassisBd;
++	  chassisBd.type = b2_dynamicBody;
++	  chassisBd.position = b2Vec2(0.0f, 0.0f);
++	  // give the chassis some damping
++	  //chassisBd.linearDamping = 1.0;
++	  //chassisBd.angularDamping = 1.0;
++
++	  chassis = world->CreateBody(&chassisBd);
++
++	  b2FixtureDef chassisFixture;
++	  b2PolygonShape chassisShape;
++	  chassisShape.SetAsBox(halfWidth, halfHeight);
++	  chassisFixture.shape = &chassisShape;
++	  chassisFixture.density = 0.05 * defaultDensity;
++	  chassisFixture.friction = defaultFriction;
++
++	  chassis->CreateFixture(&chassisFixture);
++	  chassis->ResetMassData(); // necessary?
++	}
++	
++	{
++	  b2FixtureDef wheelDef;
++	  b2PolygonShape wheelShape;
++	  wheelShape.SetAsBox(wheelDims[0], wheelDims[1]);
++	  wheelDef.shape = &wheelShape;
++	  wheelDef.density = defaultDensity/4.0;
++	  wheelDef.friction = defaultFriction;
++
++	  wheels[0] = makeWheel(-1, 1, wheelDef);
++	  wheels[1] = makeWheel(1, 1, wheelDef);
++	  wheels[2] = makeWheel(-1, -1, wheelDef);
++	  wheels[3] = makeWheel(1, -1, wheelDef);
++	}
++
++	{
++	  //Make the thing that ties the wheels together.
++	  b2DistanceJointDef rackDef;
++
++	  b2Body *w0 = wheels[0];
++	  b2Body *w1 = wheels[1];
++
++	  float32 offset = wheelDims[1] / 2.0f * 2.0f;
++
++	  b2Vec2 pos0 = w0->GetWorldCenter();
++	  b2Vec2 pos1 = w1->GetWorldCenter();
++
++	  pos0.y += offset;
++	  pos1.y += offset;
++
++	  rackDef.Initialize(w0, w1, pos0, pos1);
++
++	  world->CreateJoint(&rackDef);
++	}
++
++	// for (b2Body* b = world->GetBodyList(); b; b = b->GetNext()) {
++	// 	b->Dump();
++	// }
++      }
++
++  void Steer(float32 dir = 1.0)
++  {
++    frontLeftJoint->SetMotorSpeed(dir * 2.0);
++  }
++
++  void Accelerate(float32 dir = 1.0)
++  {
++    // Which two wheels do we power?
++    int offset = frontWheelDrive ? 0 : 2;
++
++    for (int i = 0; i < 2; i++) {
++      b2Body *wheel = wheels[i + offset];
++      b2Vec2 force_vector = wheel->GetTransform().q.GetYAxis();
++      force_vector *= accelerateForce * dir;
++      wheel->ApplyForce(force_vector, wheel->GetWorldCenter());
++    }
++  }
++
++
++  virtual ~MyCar()
++    {
++    }
++
++ private:
++
++  b2Body* makeWheel(float32 xmul, float32 ymul, b2FixtureDef &wheelDef)
++  {
++    b2BodyDef bd;
++    bd.type = b2_dynamicBody;
++    b2Body *wheel;
++    bd.position = b2Vec2(xmul * (halfWidth - wheelDims[0]), ymul * halfHeight);
++
++    wheel = world->CreateBody(&bd);
++    wheel->CreateFixture(&wheelDef);
++    wheel->SetLinearDamping(0.01f);
++    wheel->SetAngularDamping(5.0);
++    wheel->ResetMassData(); // necessary?
++
++    b2RevoluteJointDef jointDef;
++    jointDef.Initialize(chassis, wheel, wheel->GetWorldCenter());
++
++    // If we're doing the front wheels
++    if (ymul > 0) {
++      jointDef.lowerAngle = -0.25 * b2_pi;
++      jointDef.upperAngle = 0.25 * b2_pi;
++    }
++
++    jointDef.enableLimit = true;
++
++    b2RevoluteJoint *joint = (b2RevoluteJoint*)world->CreateJoint(&jointDef);
++    if (xmul < 0 && ymul > 0)
++      {
++	frontLeftJoint = joint;
++	frontLeftJoint->EnableMotor(true);
++	frontLeftJoint->SetMaxMotorTorque(5000.0f);
++      }
++
++    {
++      float mass = wheel->GetMass();
++
++      b2FrictionJointDef jd;
++      jd.localAnchorA.SetZero();
++      jd.localAnchorB.SetZero();
++      jd.bodyA = ground;
++      jd.bodyB = wheel;
++      jd.collideConnected = true;
++      jd.maxForce = 100.0;  //* mass
++      jd.maxTorque = 50.0; //* mass
++      jd.muX = 20.0;
++      jd.muY = 0.0;
++      world->CreateJoint(&jd);
++      
++    }
++
++    return wheel;
++  }
++
++};
++
++class TopDownCar : public Test
++{
++  MyCar *car;
++ public:
++  TopDownCar()
++    {
++      m_world->SetGravity(b2Vec2(0.0f, 0.0f));
++		
++      b2Body* ground;
++      b2BodyDef bd;
++      bd.position.Set(0.0f, 0.0f);
++      ground = m_world->CreateBody(&bd);
++
++      car = new MyCar(m_world, ground, 2.0, 4.0);
++    }
++
++  void Keyboard(unsigned char key)
++  {
++    switch (key)
++      {
++      case 'f':
++	car->frontWheelDrive = !car->frontWheelDrive;
++	break;
++
++      case 'w':
++	car->Accelerate(1.0);
++	break;
++
++      case 's':
++	car->Accelerate(-1.0);
++	break;
++
++      case 'a':
++	car->Steer(1.0f);
++	break;
++
++      case 'd':
++	car->Steer(-1.0f);
++	break;
++      }    
++  }
++
++  void KeyboardUp(unsigned char key) 
++  {
++    car->Steer(0.0f);
++  }
++
++  virtual ~TopDownCar()
++    {
++      delete car;
++    }
++
++  static Test* Create()
++  {
++    return new TopDownCar;
++  }
++
++};
++
++
++#endif
+diff -rupN Box2D_v2.2.1/Testbed/Tests/WheelConstraint.h Box2D_v2.2.1_fjmod/Testbed/Tests/WheelConstraint.h
+--- Box2D_v2.2.1/Testbed/Tests/WheelConstraint.h	1969-12-31 19:00:00.000000000 -0500
++++ Box2D_v2.2.1_fjmod/Testbed/Tests/WheelConstraint.h	2012-11-13 21:13:29.000000000 -0500
+@@ -0,0 +1,178 @@
++/*
++ * Copyright (c) 2006-2009 Erin Catto http://www.gphysics.com
++ *
++ * This software is provided 'as-is', without any express or implied
++ * warranty.  In no event will the authors be held liable for any damages
++ * arising from the use of this software.
++ * Permission is granted to anyone to use this software for any purpose,
++ * including commercial applications, and to alter it and redistribute it
++ * freely, subject to the following restrictions:
++ * 1. The origin of this software must not be misrepresented; you must not
++ * claim that you wrote the original software. If you use this software
++ * in a product, an acknowledgment in the product documentation would be
++ * appreciated but is not required.
++ * 2. Altered source versions must be plainly marked as such, and must not be
++ * misrepresented as being the original software.
++ * 3. This notice may not be removed or altered from any source distribution.
++ */
++
++#ifndef WHEEL_CONSTRAINT_H
++#define WHEEL_CONSTRAINT_H
++
++#include <stdio.h>
++
++class MyWheel
++{
++public:
++	float32 wheelDims[2];
++
++	float32 defaultDensity;
++	float32 defaultFriction;
++	float32 accelerateForce;
++
++	b2Body* wheels[1];
++	b2World* world;
++	b2Body* ground;
++
++	MyWheel(b2World *_world, b2Body* _ground, float32 width, float32 height) :
++		defaultDensity(20.0f),
++		defaultFriction(0.68f),
++		accelerateForce(2500.0f),
++		ground(_ground),
++		world(_world)
++	{
++		wheelDims[0] = 1.0;
++		wheelDims[1] = 0.3;
++		b2FixtureDef wheelDef;
++		b2PolygonShape wheelShape;
++		wheelShape.SetAsBox(wheelDims[0], wheelDims[1]);
++		wheelDef.shape = &wheelShape;
++		wheelDef.density = defaultDensity/4.0;
++		wheelDef.friction = defaultFriction;
++
++		wheels[0] = makeWheel(width, height, wheelDef);
++
++		// for (b2Body* b = world->GetBodyList(); b; b = b->GetNext()) {
++		// 	b->Dump();
++		// }
++	}
++
++	virtual ~MyWheel()
++	{
++	}
++
++	void Steer(float32 dir = 1.0)
++	{
++		float32 torque_incr = 500.0;
++		b2Body *wheel = this->wheels[0];
++		wheel->ApplyTorque(dir * torque_incr);
++	}
++
++	void Accelerate(float32 ax = 0.0, float32 ay = 0.0)
++	{
++		b2Body *wheel = this->wheels[0];
++		b2Vec2 dir = b2Vec2(accelerateForce * ax, accelerateForce * ay);
++		b2Vec2 force_vector =  wheel->GetWorldVector(dir);
++		wheel->ApplyForce(force_vector, wheel->GetWorldCenter());
++	}
++
++private:
++
++	b2Body* makeWheel(float32 xmul, float32 ymul, b2FixtureDef &wheelDef)
++	{
++		b2BodyDef bd;
++		bd.type = b2_dynamicBody;
++		b2Body *wheel;
++		bd.position = b2Vec2(xmul, ymul);
++
++		wheel = world->CreateBody(&bd);
++		wheel->CreateFixture(&wheelDef);
++		wheel->SetLinearDamping(0.0); // 0.01f
++		wheel->SetAngularDamping(0.0); // 5.0
++		wheel->ResetMassData(); // necessary?
++
++		// Add friction joint:
++		{
++			b2FrictionJointDef jd;
++			jd.localAnchorA.SetZero();
++			jd.localAnchorB.SetZero();
++			jd.bodyA = ground;
++			jd.bodyB = wheel;
++			jd.collideConnected = true;
++			jd.maxForce = 100.0;  // * mass
++			jd.maxTorque = 50.0; // * mass
++			jd.muX = 0.001;
++			jd.muY = 0.9;
++			jd.muT = 1.0;
++			world->CreateJoint(&jd);
++		}
++
++		return wheel;
++	}
++};
++
++class TopDownWheel : public Test
++{
++
++	MyWheel *wheel;
++public:
++
++	TopDownWheel()
++{
++		m_world->SetGravity(b2Vec2(0.0f, 0.0f));
++
++		b2Body* ground;
++		b2BodyDef bd;
++		bd.position.Set(0.0f, 0.0f);
++		ground = m_world->CreateBody(&bd);
++
++		wheel = new MyWheel(m_world, ground, 2.0, 4.0);
++}
++
++	void Keyboard(unsigned char key)
++	{
++		switch (key)
++		{
++		case 'w':
++			wheel->Accelerate(1.0, 0.0);
++			break;
++
++		case 's':
++			wheel->Accelerate(-1.0, 0.0);
++			break;
++
++		case 'd':
++			wheel->Accelerate(0.0, -1.0);
++			break;
++
++		case 'a':
++			wheel->Accelerate(0.0, 1.0);
++			break;
++
++		case 'q':
++			wheel->Steer(1.0f);
++			break;
++
++		case 'e':
++			wheel->Steer(-1.0f);
++			break;
++		}
++	}
++
++	void KeyboardUp(unsigned char key)
++	{
++		wheel->Steer(0.0f);
++	}
++	virtual ~TopDownWheel()
++	{
++		delete wheel;
++	}
++
++	static Test* Create()
++	{
++		return new TopDownWheel;
++	}
++
++};
++
++#endif

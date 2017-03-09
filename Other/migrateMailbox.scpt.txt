@@ -1,0 +1,217 @@
+tell application "Mail"
+	(* Info *)
+	set welcome_text to "This script copies all messages from a source mailbox to a target mailbox."
+	set warning_text to "*This is a crude duplicate checker (O(nm)), so will be slow for big mailboxes.  For big mailboxes consider running 
+'Select Duplicate Messages' from http://tim.auton.me.uk/select_duplicates.html after the copy instead"
+	set btn to display dialog welcome_text buttons {"Check for duplicates", "Just copy them!", "Cancel"} default button "Check for duplicates"
+	set resp to button returned of result
+	if resp = "Cancel" then
+		error number -128
+	else if resp = "Check for duplicates" then
+		set checkDups to true
+	else
+		set checkDups to false
+	end if
+	
+	# Interactively select source and target:
+	# Select source account
+	set theAccounts to name of every account
+	set sourceAccount to choose from list theAccounts with prompt "Select Source Account"
+	set sourceAccountName to item 1 of sourceAccount
+	
+	#Select a source mailbox
+	set theMailboxes to every mailbox of account sourceAccountName
+	set fullMailboxNames to my getFullMailboxPaths(theMailboxes, sourceAccountName)
+	set sourceMailbox to choose from list fullMailboxNames with prompt "Select source mailbox"
+	set sourceMailboxName to item 1 of sourceMailbox
+	
+	# Select target account
+	set targetAccount to choose from list theAccounts with prompt "Select Destination Account"
+	set targetAccountName to item 1 of targetAccount
+	
+	#Select a target top-level mailbox
+	set theMailboxes to every mailbox of account targetAccountName
+	set fullMailboxNames to my getFullMailboxPaths(theMailboxes, targetAccountName)
+	set targetTLMailbox to choose from list fullMailboxNames with prompt "Select top-level mailbox (optional)"
+	if targetTLMailbox is false then
+		set targetTLMailboxName to ""
+	else
+		set targetTLMailboxName to item 1 of targetTLMailbox
+	end if
+	
+	(* To Hard-code source and target
+	set sourceAccountName to "GaTech"
+	set sourceMailboxName to "CoC Lists/Slush"
+	set targetAccountName to "Gmail"
+	set targetTLMailboxName to "Junk"
+	set checkDups to true *)
+	
+	# Verify that destination mailbox exists
+	set targetMailboxFullName to targetTLMailboxName & "/" & sourceMailboxName
+	tell account targetAccountName
+		if not (exists mailbox (targetTLMailboxName & "/" & sourceMailboxName)) then
+			set mbox to make new mailbox with properties {name:targetMailboxFullName}
+		end if
+	end tell
+	
+	# Grab list of messages
+	set theMessages to messages in mailbox sourceMailboxName of account sourceAccountName
+	
+	if checkDups is true then
+		set src_messages to (get every message in mailbox sourceMailboxName of account sourceAccountName)
+		set {src_message_ids, src_message_sizes} to (get {message id, message size} of every message in mailbox sourceMailboxName of account sourceAccountName)
+		
+		-- Get sorted list of source messages
+		set start_sort_time to current date
+		set src_message_ids_ref to a reference to src_message_ids
+		set src_messages_ref to a reference to src_messages
+		set src_message_sizes_ref to a reference to src_message_sizes
+		with timeout of 1000000 seconds
+			my combsort(src_message_ids_ref, {src_messages_ref, src_message_sizes_ref})
+		end timeout
+		set sort_time to (current date) - start_sort_time
+		
+		-- Get sorted list of target messages
+		set target_messages to (get every message in mailbox targetMailboxFullName of account targetAccountName)
+		set {target_message_ids, target_message_sizes} to (get {message id, message size} of every message in mailbox targetMailboxFullName of account targetAccountName)
+		if length of target_messages > 0 then
+			set start_sort_time to current date
+			set target_message_ids_ref to a reference to target_message_ids
+			set target_messages_ref to a reference to target_messages
+			set target_message_sizes_ref to a reference to target_message_sizes
+			with timeout of 1000000 seconds
+				my combsort(target_message_ids_ref, {target_messages_ref, target_message_sizes_ref})
+			end timeout
+			set sort_time to (current date) - start_sort_time
+		end if
+		
+		set messages_to_copy to {}
+		set n_target_msgs to (count (target_messages))
+		set target_msg_list_ptr to 1
+		if length of src_messages_ref > 1 then
+			repeat with i from 2 to length of src_messages_ref
+				#set this_message_ref to (a reference to item i of src_messages_ref)
+				set this_message to item i of src_messages_ref
+				set this_message_matches to false
+				if target_msg_list_ptr < n_target_msgs then
+					# Iterate through and select messages in src_messages until a match is found in target_messages
+					if item i of src_message_ids_ref = item target_msg_list_ptr of target_message_ids_ref then
+						set this_message_matches to true
+						# Then iterate through target messages until a non-match is found
+						repeat
+							set target_msg_list_ptr to target_msg_list_ptr + 1
+							if target_msg_list_ptr > n_target_msgs or item i of src_message_ids_ref is not equal to item target_msg_list_ptr of target_message_ids_ref then
+								exit repeat
+							end if
+						end repeat
+					end if
+				end if
+				
+				# If this message didn't match, then add it
+				if not this_message_matches then
+					set end of messages_to_copy to this_message #_ref
+				end if
+			end repeat
+		end if
+		set cont_str to "Source ( " & sourceMailboxName & "): " & (count (src_message_ids)) & "
+Target ( " & targetMailboxFullName & "): " & (count (target_message_ids)) & "
+Non-duplicates to copy: " & (count (messages_to_copy))
+		display dialog cont_str buttons {"Continue", "Cancel"} default button "Continue"
+		set resp to button returned of result
+		#{count (messages_to_copy), count (src_message_ids), count (target_message_ids)}
+		if resp = "Continue" then
+			(*  Perform copy of unmatched messages *)
+			if (count of messages_to_copy) is greater than 0 then
+				duplicate messages_to_copy to mailbox targetMailboxFullName of account targetAccountName
+			end if
+		end if
+		
+		# Old Version:
+		(*if checkDups is true then
+		# Copy messages over, while checking for duplicates (this is O(nm), so will be slow for big mailboxes)
+		set copylist to {}
+		set existingMessages to messages in mailbox targetMailboxFullName of account targetAccountName
+		repeat with msg in theMessages
+			set matched to false
+			repeat with tmsg in existingMessages
+				if message id of msg is equal to message id of tmsg then
+					set matched to true
+					exit repeat
+				end if
+			end repeat
+			if matched is false then
+				set end of copylist to msg
+			end if
+		end repeat
+		
+		# Perform copy of unmatched messages
+		if (count of copylist) is greater than 0 then
+			duplicate copylist to mailbox targetMailboxFullName of account targetAccountName
+		end if *)
+	else
+		# Just copy everything
+		if (count of theMessages) is greater than 0 then
+			duplicate theMessages to mailbox targetMailboxFullName of account targetAccountName
+		end if
+	end if
+end tell
+
+on getFullMailboxPaths(theMailboxes, sourceAccountName)
+	tell application "Mail"
+		set theMailboxNames to {}
+		repeat with theMailbox in theMailboxes
+			set theMailboxName to ""
+			set par to theMailbox
+			repeat while name of par is not sourceAccountName
+				if theMailboxName is not "" then
+					set theMailboxName to the name of par & "/" & theMailboxName
+				else
+					set theMailboxName to the name of par
+				end if
+				set par to container of par
+			end repeat
+			set end of theMailboxNames to theMailboxName
+		end repeat
+	end tell
+	return theMailboxNames
+end getFullMailboxPaths
+
+-- in-place combsort 
+-- takes: two lists
+-- sorts based on key_list, keeps dat_list in sync
+-- you could use a quicksort, but given everything else takes so long this is fine
+on combsort(key_list, data_lists)
+	-- keeping the dat in a script and accessing it by reference boosts performance
+	
+	set gap to length of key_list
+	set swapped to false
+	
+	repeat until swapped = false and gap = 1
+		if gap > 1 then
+			set gap to round (gap / 1.3) rounding down
+			if gap = 9 or gap = 10 then
+				set gap to 11
+			end if
+		end if
+		
+		set i to 1
+		set swapped to false
+		repeat until i + gap > length of key_list
+			set j to i + gap
+			set item_i to item i of key_list
+			set item_j to item j of key_list
+			if item_i comes after item_j then
+				set item i of key_list to item_j
+				set item j of key_list to item_i
+				repeat with each_dl in data_lists
+					set tmp to item i of each_dl
+					set item i of each_dl to item j of each_dl
+					set item j of each_dl to tmp
+				end repeat
+				set swapped to true
+			end if
+			set i to i + 1
+		end repeat
+	end repeat
+	return
+end combsort

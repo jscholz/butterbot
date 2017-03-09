@@ -1,0 +1,529 @@
+diff -rupN --exclude=.svn pybox2d-read-only/Box2D/Box2D_joints.i pybox2d-fjmod/Box2D/Box2D_joints.i
+--- pybox2d-read-only/Box2D/Box2D_joints.i	2012-11-13 21:06:28.000000000 -0500
++++ pybox2d-fjmod/Box2D/Box2D_joints.i	2012-11-13 21:06:29.000000000 -0500
+@@ -278,6 +278,9 @@ public:
+         # Read-write properties
+         maxForce = property(__GetMaxForce, __SetMaxForce)
+         maxTorque = property(__GetMaxTorque, __SetMaxTorque)
++        muX = property(__GetMuX, __SetMuX)
++        muY = property(__GetMuY, __SetMuY)
++        muT = property(__GetMuT, __SetMuT)
+     %}
+ }
+ 
+@@ -285,7 +288,13 @@ public:
+ %rename(__GetMaxTorque) b2FrictionJoint::GetMaxTorque;
+ %rename(__SetMaxTorque) b2FrictionJoint::SetMaxTorque;
+ %rename(__SetMaxForce) b2FrictionJoint::SetMaxForce;
+-
++%rename(__GetMuX) b2FrictionJoint::GetMuX;
++%rename(__SetMuX) b2FrictionJoint::SetMuX;
++%rename(__GetMuY) b2FrictionJoint::GetMuY;
++%rename(__SetMuY) b2FrictionJoint::SetMuY;
++%rename(__GetMuT) b2FrictionJoint::GetMuT;
++%rename(__SetMuT) b2FrictionJoint::SetMuT;
++		
+ /**** Add some of the functionality that Initialize() offers for joint definitions ****/
+ /**** DistanceJointDef ****/
+ %extend b2DistanceJointDef {
+diff -rupN --exclude=.svn pybox2d-read-only/Box2D/Box2D_printing.i pybox2d-fjmod/Box2D/Box2D_printing.i
+--- pybox2d-read-only/Box2D/Box2D_printing.i	2012-11-13 21:06:28.000000000 -0500
++++ pybox2d-fjmod/Box2D/Box2D_printing.i	2012-11-13 21:06:29.000000000 -0500
+@@ -261,13 +261,13 @@ def _format_repr(item, props, indent_amo
+ %extend b2FrictionJoint {
+     %pythoncode %{
+         def __repr__(self):
+-            return _format_repr(self, ['active','anchorA','anchorB','bodyA','bodyB','maxForce','maxTorque','type','userData']) 
++            return _format_repr(self, ['active','anchorA','anchorB','bodyA','bodyB','maxForce','maxTorque','type','userData', 'muX', 'muY', 'muT']) 
+     %}
+ }
+ %extend b2FrictionJointDef {
+     %pythoncode %{
+         def __repr__(self):
+-            return _format_repr(self, ['anchor','bodyA','bodyB','collideConnected','localAnchorA','localAnchorB','maxForce','maxTorque','type','userData']) 
++            return _format_repr(self, ['anchor','bodyA','bodyB','collideConnected','localAnchorA','localAnchorB','maxForce','maxTorque','type','userData', 'muX', 'muY', 'muT']) 
+     %}
+ }
+ %extend b2GearJoint {
+diff -rupN --exclude=.svn pybox2d-read-only/Box2D/Dynamics/Joints/b2FrictionJoint.cpp pybox2d-fjmod/Box2D/Dynamics/Joints/b2FrictionJoint.cpp
+--- pybox2d-read-only/Box2D/Dynamics/Joints/b2FrictionJoint.cpp	2012-11-13 21:06:28.000000000 -0500
++++ pybox2d-fjmod/Box2D/Dynamics/Joints/b2FrictionJoint.cpp	2012-11-13 21:06:29.000000000 -0500
+@@ -51,6 +51,13 @@ b2FrictionJoint::b2FrictionJoint(const b
+ 
+ 	m_maxForce = def->maxForce;
+ 	m_maxTorque = def->maxTorque;
++	
++	m_muX = def->muX;
++	m_muY = def->muY;
++	m_muT = def->muT;
++	m_muXY.Set(
++			b2Vec2(m_muX, 0),
++			b2Vec2(0, m_muY));
+ }
+ 
+ void b2FrictionJoint::InitVelocityConstraints(const b2SolverData& data)
+@@ -72,11 +79,13 @@ void b2FrictionJoint::InitVelocityConstr
+ 	b2Vec2 vB = data.velocities[m_indexB].v;
+ 	float32 wB = data.velocities[m_indexB].w;
+ 
+-	b2Rot qA(aA), qB(aB);
++	// set rotation matrices corresponding to body angles
++	m_qA.Set(aA);
++	m_qB.Set(aB);
+ 
+ 	// Compute the effective mass matrix.
+-	m_rA = b2Mul(qA, m_localAnchorA - m_localCenterA);
+-	m_rB = b2Mul(qB, m_localAnchorB - m_localCenterB);
++	m_rA = b2Mul(m_qA, m_localAnchorA - m_localCenterA);
++	m_rB = b2Mul(m_qB, m_localAnchorB - m_localCenterB);
+ 
+ 	// J = [-I -r1_skew I r2_skew]
+ 	//     [ 0       -1 0       1]
+@@ -104,7 +113,8 @@ void b2FrictionJoint::InitVelocityConstr
+ 		m_angularMass = 1.0f / m_angularMass;
+ 	}
+ 
+-	if (data.step.warmStarting)
++	// warm starting causes instabilities for 2D friction
++	if (false) // (data.step.warmStarting)
+ 	{
+ 		// Scale impulses to support a variable time step.
+ 		m_linearImpulse *= data.step.dtRatio;
+@@ -143,7 +153,7 @@ void b2FrictionJoint::SolveVelocityConst
+ 	// Solve angular friction
+ 	{
+ 		float32 Cdot = wB - wA;
+-		float32 impulse = -m_angularMass * Cdot;
++		float32 impulse = -m_angularMass * m_muT * Cdot; // scaled angular impulse
+ 
+ 		float32 oldImpulse = m_angularImpulse;
+ 		float32 maxImpulse = h * m_maxTorque;
+@@ -158,7 +168,12 @@ void b2FrictionJoint::SolveVelocityConst
+ 	{
+ 		b2Vec2 Cdot = vB + b2Cross(wB, m_rB) - vA - b2Cross(wA, m_rA);
+ 
+-		b2Vec2 impulse = -b2Mul(m_linearMass, Cdot);
++		// Compute orthogonal friction impulses in bodyB frame, and rotate back
++		b2Vec2 vb = b2MulT(m_qB, Cdot);		// velocity in constraint frame
++		b2Vec2 fb = b2Mul(m_muXY, vb);  	// friction forces in constraint frame
++		b2Vec2 fw = b2Mul(m_qB, fb);		// friction forces in world frame
++		b2Vec2 impulse = -b2Mul(m_linearMass, fw);
++
+ 		b2Vec2 oldImpulse = m_linearImpulse;
+ 		m_linearImpulse += impulse;
+ 
+@@ -234,6 +249,38 @@ float32 b2FrictionJoint::GetMaxTorque() 
+ 	return m_maxTorque;
+ }
+ 
++float32 b2FrictionJoint::GetMuX() const
++{
++	return m_muX;
++}
++
++void b2FrictionJoint::SetMuX(float32 muX)
++{
++	m_muX = muX;
++	m_muXY.ex.x = m_muX;
++}
++
++float32 b2FrictionJoint::GetMuY() const
++{
++	return m_muY;
++}
++
++void b2FrictionJoint::SetMuY(float32 muY)
++{
++	m_muY = muY;
++	m_muXY.ey.y = m_muY;
++}
++
++float32 b2FrictionJoint::GetMuT() const
++{
++	return m_muT;
++}
++
++void b2FrictionJoint::SetMuT(float32 muT)
++{
++	m_muT = muT;
++}
++
+ void b2FrictionJoint::Dump()
+ {
+ 	int32 indexA = m_bodyA->m_islandIndex;
+diff -rupN --exclude=.svn pybox2d-read-only/Box2D/Dynamics/Joints/b2FrictionJoint.h pybox2d-fjmod/Box2D/Dynamics/Joints/b2FrictionJoint.h
+--- pybox2d-read-only/Box2D/Dynamics/Joints/b2FrictionJoint.h	2012-11-13 21:06:28.000000000 -0500
++++ pybox2d-fjmod/Box2D/Dynamics/Joints/b2FrictionJoint.h	2012-11-13 21:06:29.000000000 -0500
+@@ -31,6 +31,9 @@ struct b2FrictionJointDef : public b2Joi
+ 		localAnchorB.SetZero();
+ 		maxForce = 0.0f;
+ 		maxTorque = 0.0f;
++		muX = 0;
++		muY = 0;
++		muT = 0;
+ 	}
+ 
+ 	/// Initialize the bodies, anchors, axis, and reference angle using the world
+@@ -48,6 +51,11 @@ struct b2FrictionJointDef : public b2Joi
+ 
+ 	/// The maximum friction torque in N-m.
+ 	float32 maxTorque;
++	
++	/// The orthogonal and angular friction components
++	float32 muX;
++	float32 muY;
++	float32 muT;
+ };
+ 
+ /// Friction joint. This is used for top-down friction.
+@@ -79,6 +87,24 @@ public:
+ 	/// Get the maximum friction torque in N*m.
+ 	float32 GetMaxTorque() const;
+ 
++	/// Get the X friction component
++	float32 GetMuX() const;
++
++	/// Set the X friction component
++	void SetMuX(float32 muX);
++
++	/// Get the Y friction component
++	float32 GetMuY() const;
++
++	/// Set the Y friction component
++	void SetMuY(float32 muY);
++
++	/// Get the T friction component
++	float32 GetMuT() const;
++
++	/// Set the T friction component
++	void SetMuT(float32 muT);
++	
+ 	/// Dump joint to dmLog
+ 	void Dump();
+ 
+@@ -114,6 +140,14 @@ protected:
+ 	float32 m_invIB;
+ 	b2Mat22 m_linearMass;
+ 	float32 m_angularMass;
++	b2Rot m_qA, m_qB;	// for representing body orientations inside solver loop
++	
++	/// Orthogonal friction components
++	float32 m_muX;
++	float32 m_muY;
++	float32 m_muT;
++	/// A matrix representation of the linear friction components (for efficiency)
++	b2Mat22 m_muXY;
+ };
+ 
+ #endif
+diff -rupN --exclude=.svn pybox2d-read-only/README.FJMod pybox2d-fjmod/README.FJMod
+--- pybox2d-read-only/README.FJMod	1969-12-31 19:00:00.000000000 -0500
++++ pybox2d-fjmod/README.FJMod	2012-11-13 21:06:29.000000000 -0500
+@@ -0,0 +1,44 @@
++== FrictionJoint Mod ==
++The code has been modified to simulate 2D friction, such as might be necessary for top-down
++cars or other wheeled bodies.  The Box2D changes are restricted to the FrictionJoint class, 
++and there are also two test classes.  The first (test_TopDownFrictionJoint) demonstrates the 
++top-down joint attached to a single body, and the second (test_TopDownCar) shows how to build
++and control a car using these joints.  
++
++This is checkout of pybox2d r358.
++
++== Explanation ==
++According to documentation and Erin's comments online, the FrictionJoint class was implemented 
++in a fairly recent version of Box2D to provide modelers a way of simulating friction in top-down
++worlds (Box2D is really meant for vertical simulations, like Angry Birds).  However, despite 
++citing MikeRLewis's working friction joint as inspiration[1], Erin's current implementation (2.2.1)
++does not allow independent friction components in the FrictionJoint class.  In fact this class
++simply calculates the relative velocity between anchor points and applies a scaled, thresholded 
++impulse in the opposite direction.  
++
++The fix for this was straightforward, but required changing the FrictionJoint definition to include
++three new parameters: the friction coefficients in X, Y, and Theta.  
++
++IMPORTANT: because this joint is now directional, it's important to specify the joints in the right 
++order.  The FrictionJoint solver uses the pose of bodyB to compute friction forces (IE it assumes
++the friction contact is located at anchorB), which means that the correct order for simulating 
++wheels is bodyA=ground, bodyB=wheel.  
++
++
++== Changed Files ==
++	Box2D/Box2D_joints.i
++	Box2D/Box2D_printing.i
++	Box2D/Dynamics/Joints/b2FrictionJoint.cpp
++	Box2D/Dynamics/Joints/b2FrictionJoint.h
++	examples/test_TopDownFrictionJoint.py
++	examples/test_TopDownCar.py
++	
++== References == 
++[1] Original friction joint, courtesy MikeRLewis http://www.box2d.org/forum/viewtopic.php?f=2&t=4010
++[2] My original post about the topic http://www.box2d.org/forum/viewtopic.php?f=3&t=8431
++[3] Follow-up post to [2] http://www.box2d.org/forum/viewtopic.php?f=19&t=6480
++[4] http://gamedev.stackexchange.com/questions/23093/creating-sideways-friction-in-a-2d-top-down-racer
++[5] http://www.box2d.org/forum/viewtopic.php?f=3&t=3902
++[6] http://www.box2d.org/forum/viewtopic.php?f=8&t=3968
++[7] http://www.box2d.org/forum/viewtopic.php?f=3&t=7468
++
+diff -rupN --exclude=.svn pybox2d-read-only/examples/test_TopDownCar.py pybox2d-fjmod/examples/test_TopDownCar.py
+--- pybox2d-read-only/examples/test_TopDownCar.py	1969-12-31 19:00:00.000000000 -0500
++++ pybox2d-fjmod/examples/test_TopDownCar.py	2012-11-13 21:06:29.000000000 -0500
+@@ -0,0 +1,169 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++#
++# C++ version Copyright (c) 2006-2007 Erin Catto http://www.box2d.org
++# Python version Copyright (c) 2010 kne / sirkne at gmail dot com
++# 
++# This software is provided 'as-is', without any express or implied
++# warranty.	 In no event will the authors be held liable for any damages
++# arising from the use of this software.
++# Permission is granted to anyone to use this software for any purpose,
++# including commercial applications, and to alter it and redistribute it
++# freely, subject to the following restrictions:
++# 1. The origin of this software must not be misrepresented; you must not
++# claim that you wrote the original software. If you use this software
++# in a product, an acknowledgment in the product documentation would be
++# appreciated but is not required.
++# 2. Altered source versions must be plainly marked as such, and must not be
++# misrepresented as being the original software.
++# 3. This notice may not be removed or altered from any source distribution.
++
++from framework import *
++from math import sqrt
++
++class Car(object):
++	"""docstring for Car"""
++	# Constants
++	carDims = (3, 1.5)
++	rwDims = (0.6, 0.3)
++	fwDims = (0.6, 0.2)
++	frontWheelDrive = False
++	accelerateForce = 500
++	steeringRate = 5
++	
++	def __init__(self, world, ground, pos = (0,0), scale = 1.0):
++		"""Creates a car in the provided world, and joined via friction joints to the
++		provided ground
++		@param world A b2World with a static ground body defined
++		@param ground A static ground"""
++		super(Car, self).__init__()
++		# set the world
++		self.world = world
++		self.ground = ground
++		self.accelerateForce *= scale**2
++		
++		# Make a chassis
++		chassisDef = b2FixtureDef(
++			shape = b2PolygonShape(box = (scale * self.carDims[0], 
++										  scale * self.carDims[1])), 
++			density = 0.1, 
++			friction = 0.3)
++		self.chassis = self.world.CreateDynamicBody(position = pos, fixtures = chassisDef)
++				
++		# Add the 4 wheels
++		self.wheel_br = self._makewheel((-self.carDims[0], -self.carDims[1]), self.rwDims[0], self.rwDims[1], scale)
++		self.wheel_bl = self._makewheel((-self.carDims[0], self.carDims[1]), self.rwDims[0], self.rwDims[1], scale)
++		self.wheel_fr = self._makewheel((self.carDims[0], -self.carDims[1]), self.fwDims[0], self.fwDims[1], scale)
++		self.wheel_fl = self._makewheel((self.carDims[0], self.carDims[1]), self.fwDims[0], self.fwDims[1], scale)
++		
++		# Add steering rack
++		djd = Box2D.b2DistanceJointDef()
++		djd.bodyA = self.wheel_fr
++		djd.bodyB = self.wheel_fl
++		djd.anchorA = self.wheel_fr.worldCenter + b2Vec2(-self.fwDims[0], 0)
++		djd.anchorB = self.wheel_fl.worldCenter + b2Vec2(-self.fwDims[0], 0)
++		self.world.CreateJoint(djd)
++		
++	def _makewheel(self, offset, length, width, scale = 1., muX = 0.001, muY = 0.8, muT = 0.0):
++		front = False
++		drive = False
++		if offset[0] > 0:
++			front = True
++			if offset[1] > 0:
++				drive = True			
++		pos = Box2D.b2Mul(self.chassis.transform, b2Vec2(offset) * scale)
++		length *= scale
++		width *= scale
++		boxdef = b2FixtureDef(
++			shape = b2PolygonShape(box = (length, width)), 
++			density = 1, 
++			friction = 0.3)
++		wheel = self.world.CreateDynamicBody(position = pos, fixtures = boxdef)
++		
++		# Make revolute joint between wheel and chassis
++		rjd = Box2D.b2RevoluteJointDef()
++		rjd.bodyA = self.chassis
++		rjd.bodyB = wheel
++		rjd.anchor = wheel.worldCenter
++		rjd.enableLimit = True
++		if front:
++			rjd.lowerAngle = -0.25 * Box2D.b2_pi
++			rjd.upperAngle = 0.25 * Box2D.b2_pi
++		if drive:
++ 			rjd.enableMotor = True
++			rjd.maxMotorTorque = 1000
++			
++		joint = self.world.CreateJoint(rjd)
++		if drive:
++			self.steeringJoint = joint
++		
++		# Make friction joint between wheel and ground
++		hypothetical_gravity = 9.8
++		self.world.CreateFrictionJoint(
++			bodyA = self.ground,
++			bodyB = wheel,
++			localAnchorA = (0,0), 
++			localAnchorB = (0,0), 
++			collideConnected = True,
++			maxForce = (4*wheel.mass + self.chassis.mass) * hypothetical_gravity,
++			maxTorque = wheel.mass * length * width * hypothetical_gravity,
++			muX = muX,
++			muY = muY,
++			muT = muT)
++		return(wheel)
++		
++	def steer(self, dir = 0.):
++		"""docstring for steer"""
++		#self.chassis.ApplyTorque(omega)
++		self.steeringJoint.motorSpeed = dir * self.steeringRate;
++		
++	def accelerate(self, fx = 0., fy = 0.):
++		"""docstring for accelerate"""
++		if self.frontWheelDrive:
++			wheels = [self.wheel_fr, self.wheel_fl]
++		else:
++			wheels = [self.wheel_br, self.wheel_bl]
++		for wheel in wheels:
++			force = wheel.GetWorldVector(localVector = (fx, fy)) * self.accelerateForce
++			wheel.ApplyForce(force, wheel.worldCenter)
++		
++class TopDownCar(Framework):
++	name="TopDownCar"
++	description="This demonstrates a top-down car. Use w, a, s, d to control the car, and t to toggle front wheel drive."
++	def __init__(self):
++		super(TopDownCar, self).__init__()
++		self.world.gravity = (0.0, 0.0)
++
++		# The boundaries
++		self.ground = self.world.CreateBody(position=(0, 20))
++		self.ground.CreateEdgeChain(
++							[ (-20,-20),
++							  (-20, 20),
++							  ( 20, 20),
++							  ( 20,-20),
++							  (-20,-20) ]
++							)
++		self.car = Car(self.world, self.ground, pos = (0,10), scale = 2.)
++
++	def Keyboard(self, key):
++		if not self.car:
++			return
++		if key==Keys.K_w:
++			self.car.accelerate(1, 0)
++		if key==Keys.K_s:
++			self.car.accelerate(-1, 0)
++		if key==Keys.K_a:
++			self.car.steer(1)
++		if key==Keys.K_d:
++			self.car.steer(-1)
++		elif key==Keys.K_t:
++			self.car.frontWheelDrive = not self.car.frontWheelDrive
++			print "Front wheel drive: ", self.car.frontWheelDrive
++		elif key==Keys.K_i:
++			import ipdb; ipdb.set_trace()
++			
++	def KeyboardUp(self, key):
++		self.car.steer(0)
++
++if __name__=="__main__":
++	 main(TopDownCar)
+diff -rupN --exclude=.svn pybox2d-read-only/examples/test_TopDownFrictionJoint.py pybox2d-fjmod/examples/test_TopDownFrictionJoint.py
+--- pybox2d-read-only/examples/test_TopDownFrictionJoint.py	1969-12-31 19:00:00.000000000 -0500
++++ pybox2d-fjmod/examples/test_TopDownFrictionJoint.py	2012-11-13 21:06:29.000000000 -0500
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++#
++# C++ version Copyright (c) 2006-2007 Erin Catto http://www.box2d.org
++# Python version Copyright (c) 2010 kne / sirkne at gmail dot com
++# 
++# This software is provided 'as-is', without any express or implied
++# warranty.	 In no event will the authors be held liable for any damages
++# arising from the use of this software.
++# Permission is granted to anyone to use this software for any purpose,
++# including commercial applications, and to alter it and redistribute it
++# freely, subject to the following restrictions:
++# 1. The origin of this software must not be misrepresented; you must not
++# claim that you wrote the original software. If you use this software
++# in a product, an acknowledgment in the product documentation would be
++# appreciated but is not required.
++# 2. Altered source versions must be plainly marked as such, and must not be
++# misrepresented as being the original software.
++# 3. This notice may not be removed or altered from any source distribution.
++
++from framework import *
++from math import sqrt
++
++class TopDownFrictionJoint(Framework):
++	name="TopDownFrictionJoint"
++	description="Use w, a, and d to control the 'wheel'."
++	def __init__(self):
++		super(TopDownFrictionJoint, self).__init__()
++		self.world.gravity = (0.0, 0.0)
++
++		# The boundaries
++		self.ground = self.world.CreateBody(position=(0, 20))
++		self.ground.CreateEdgeChain(
++							[ (-20,-20),
++							  (-20, 20),
++							  ( 20, 20),
++							  ( 20,-20),
++							  (-20,-20) ]
++							)
++
++		# Make a wheel
++		self.wheel = self._makeWheel((0,10), muX = 0.0, muY = 0.8, muT = 0.0)
++
++	def _makeWheel(self, pos, length = 1.0, width = 0.3, muX = 0.001, muY = 0.8, muT = 1.0):
++		boxdef = b2FixtureDef(shape=b2PolygonShape(box=(length, width)), density=1, friction=0.3)
++		wheel = self.world.CreateDynamicBody(position = pos, fixtures = boxdef)
++		hypothetical_gravity = 9.8
++		self.world.CreateFrictionJoint(
++			bodyA = self.ground,
++			bodyB = wheel,
++			localAnchorA = (0,0), 
++			localAnchorB = (0,0), 
++			collideConnected = True,
++			maxForce = wheel.mass * hypothetical_gravity,
++			maxTorque = wheel.mass * length * width * hypothetical_gravity,
++			muX = muX,
++			muY = muY,
++			muT = muT)
++		return(wheel)
++
++	def Keyboard(self, key):
++		if not self.wheel:
++			return
++		if key==Keys.K_w:
++			f = self.wheel.GetWorldVector(localVector = (100.0, 0.0))
++			p = self.wheel.GetWorldPoint(localPoint = (0.0, 0.0))
++			self.wheel.ApplyForce(f, p)
++		if key==Keys.K_s:
++			f = self.wheel.GetWorldVector(localVector = (-100.0, 0.0))
++			p = self.wheel.GetWorldPoint(localPoint = (0.0, 0.0))
++			self.wheel.ApplyForce(f, p)
++		if key==Keys.K_a:
++			f = self.wheel.GetWorldVector(localVector = (00.0, 100.0))
++			p = self.wheel.GetWorldPoint(localPoint = (0.0, 0.0))
++			self.wheel.ApplyForce(f, p)
++		if key==Keys.K_d:
++			f = self.wheel.GetWorldVector(localVector = (0.0, -100.0))
++			p = self.wheel.GetWorldPoint(localPoint = (0.0, 0.0))
++			self.wheel.ApplyForce(f, p)
++		elif key==Keys.K_q:
++			self.wheel.ApplyTorque(50.0)
++		elif key==Keys.K_e:
++			self.wheel.ApplyTorque(-50.0)
++
++if __name__=="__main__":
++	 main(TopDownFrictionJoint)
